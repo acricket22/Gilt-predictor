@@ -1,0 +1,420 @@
+"""
+10yr Gilt Open Predictor (7–8am intraday-aware, anchored to previous close)
+
+Core idea:
+- Gilts open at 08:00, but Bund/UST/GBP trade from 07:00–08:00.
+- We explicitly use how Bund, UST and GBP move between 07:00–08:00
+  on the SAME DAY as the gilt open we are predicting.
+
+Target:
+    delta_open_from_last_t = gilt_open_t - gilt_last_{t-1}
+
+Then:
+    gilt_open_hat_t = gilt_last_{t-1} + delta_open_from_last_hat_t
+
+Inputs (from the Excel file):
+- 'Unnamed: 0'        : dates for 10yr Gilt Last
+- '10yr Gilt Last'    : gilt closing level
+- 'Unnamed: 3'        : dates for 10yr Gilt Open
+- '10yr Gilt Open'    : gilt opening level
+- 'Unnamed: 6'        : dates for VIX
+- 'VIX'               : VIX index (daily)
+- 'Unnamed: 9'        : intraday timestamps for Bund 10yr
+- 'Bund 10yr'         : Bund futures
+- 'Unnamed: 12'       : intraday timestamps for 10yr UST
+- '10yr UST'          : UST futures
+- 'Unnamed: 15'       : intraday timestamps for GBPUSD
+- 'GBPUSD Curncy'     : GBPUSD spot
+
+Requires:
+- pandas, numpy, matplotlib, scikit-learn
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from datetime import date
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import Ridge
+from sklearn.kernel_ridge import KernelRidge
+
+# ------------------ CONFIG ------------------
+
+# If None, will default to the last date in the supervised data
+FORECAST_DATE = date(2025, 11, 7) # e.g. date(2025, 11, 5)
+
+MAX_ROLL_WINDOW = 60  # max number of training rows (most recent)
+MIN_TRAIN_ROWS = 20  # minimum rows required before forecast date
+
+
+# ------------------ DATA LOADING ------------------
+
+def load_excel():
+    """
+    Looks for data.xlsx on Desktop or in current folder.
+    """
+    desktop = os.path.expanduser("~/Desktop/data.xlsx")
+    local = "data.xlsx"
+    if os.path.exists(desktop):
+        path = desktop
+    elif os.path.exists(local):
+        path = local
+    else:
+        raise FileNotFoundError("data.xlsx not found on Desktop or in current folder")
+    print(f"Loading Excel: {path}")
+    return pd.read_excel(path)
+
+
+# ------------------ INTRADAY 7–8am FEATURES ------------------
+
+def preopen_gap_7to8(df, time_col, val_col, prefix):
+    """
+    From intraday series, compute per-day 7–8am "pre-open" gap.
+
+    For each calendar date D:
+      - Use rows where time is in [07:00, 08:00)
+      - Take first value at/after 07:00     -> {prefix}_7am
+      - Take last value before 08:00        -> {prefix}_preopen
+      - Define gap: {prefix}_gap_7to8 = preopen - 7am
+
+    Returns a dataframe with:
+      ['date', f'{prefix}_7am', f'{prefix}_preopen', f'{prefix}_gap_7to8']
+    """
+    tmp = df[[time_col, val_col]].dropna().copy()
+    tmp["dt"] = pd.to_datetime(tmp[time_col])
+    tmp["date"] = tmp["dt"].dt.date
+    tmp["time"] = tmp["dt"].dt.time
+    tmp = tmp.sort_values("dt")
+
+    start_t = pd.to_datetime("07:00").time()
+    end_t = pd.to_datetime("08:00").time()
+    tmp = tmp[(tmp["time"] >= start_t) & (tmp["time"] < end_t)]
+
+    if tmp.empty:
+        raise ValueError(f"No 7–8am data found in {time_col} / {val_col}")
+
+    firsts = (
+        tmp.groupby("date")
+        .head(1)[["date", val_col]]
+        .rename(columns={val_col: f"{prefix}_7am"})
+    )
+    lasts = (
+        tmp.groupby("date")
+        .tail(1)[["date", val_col]]
+        .rename(columns={val_col: f"{prefix}_preopen"})
+    )
+
+    out = firsts.merge(lasts, on="date", how="inner")
+    out[f"{prefix}_gap_7to8"] = out[f"{prefix}_preopen"] - out[f"{prefix}_7am"]
+    return out
+
+
+# ------------------ DAILY DATA CONSTRUCTION ------------------
+
+def build_daily(raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Constructs daily data with:
+      - date
+      - gilt_open, gilt_last
+      - VIX
+      - bund_gap_7to8, ust_gap_7to8, gbp_gap_7to8
+    using the known column names from the Excel.
+    """
+    # Gilt last (close)
+    gilt_last = raw[["Unnamed: 0", "10yr Gilt Last"]].dropna().copy()
+    gilt_last["date"] = pd.to_datetime(gilt_last["Unnamed: 0"]).dt.date
+    gilt_last = gilt_last[["date", "10yr Gilt Last"]].rename(
+        columns={"10yr Gilt Last": "gilt_last"}
+    )
+
+    # Gilt open
+    gilt_open = raw[["Unnamed: 3", "10yr Gilt Open"]].dropna().copy()
+    gilt_open["date"] = pd.to_datetime(gilt_open["Unnamed: 3"]).dt.date
+    gilt_open = gilt_open[["date", "10yr Gilt Open"]].rename(
+        columns={"10yr Gilt Open": "gilt_open"}
+    )
+
+    # VIX
+    vix = raw[["Unnamed: 6", "VIX"]].dropna().copy()
+    vix["date"] = pd.to_datetime(vix["Unnamed: 6"]).dt.date
+    vix = vix[["date", "VIX"]]
+
+    # Intraday 7–8am pre-open gaps
+    bund_preopen = preopen_gap_7to8(raw, "Unnamed: 9", "Bund 10yr", "bund")
+    ust_preopen = preopen_gap_7to8(raw, "Unnamed: 12", "10yr UST", "ust")
+    gbp_preopen = preopen_gap_7to8(raw, "Unnamed: 15", "GBPUSD Curncy", "gbp")
+
+    daily = (
+        gilt_open.merge(gilt_last, on="date", how="inner")
+        .merge(vix, on="date", how="left")
+        .merge(bund_preopen, on="date", how="left")
+        .merge(ust_preopen, on="date", how="left")
+        .merge(gbp_preopen, on="date", how="left")
+        .dropna()
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+
+    return daily
+
+
+# ------------------ SUPERVISED DATASET ------------------
+
+def build_supervised(daily: pd.DataFrame):
+    """
+    Builds the supervised learning dataset.
+
+    Target (per day t):
+      delta_open_from_last_t = gilt_open_t - gilt_last_{t-1}
+
+    Features:
+      - Same-day 7–8am gaps:
+          bund_gap_7to8, ust_gap_7to8, gbp_gap_7to8
+      - Previous day context:
+          prev_gilt_last  = gilt_last_{t-1}
+          prev_gilt_open  = gilt_open_{t-1}
+          prev_VIX        = VIX_{t-1}
+      - Lagged gaps:
+          bund_gap_7to8_lag1 = bund_gap_7to8_{t-1}
+          ust_gap_7to8_lag1  = ust_gap_7to8_{t-1}
+          gbp_gap_7to8_lag1  = gbp_gap_7to8_{t-1}
+    """
+    df = daily.copy().sort_values("date").reset_index(drop=True)
+
+    df["prev_gilt_last"] = df["gilt_last"].shift(1)
+    df["prev_gilt_open"] = df["gilt_open"].shift(1)
+    df["prev_VIX"] = df["VIX"].shift(1)
+
+    for col in ["bund_gap_7to8", "ust_gap_7to8", "gbp_gap_7to8"]:
+        df[f"{col}_lag1"] = df[col].shift(1)
+
+    df["delta_open_from_last"] = df["gilt_open"] - df["prev_gilt_last"]
+
+    feature_cols = [
+        "bund_gap_7to8",
+        "ust_gap_7to8",
+        "gbp_gap_7to8",
+        "prev_gilt_last",
+        "prev_gilt_open",
+        "prev_VIX",
+        "bund_gap_7to8_lag1",
+        "ust_gap_7to8_lag1",
+        "gbp_gap_7to8_lag1",
+    ]
+
+    df_sup = df.dropna(subset=feature_cols + ["delta_open_from_last"]).reset_index(
+        drop=True
+    )
+
+    return df_sup, feature_cols
+
+
+# ------------------ SIMPLE TS-CV HELPERS (OPTIONAL) ------------------
+
+def ts_cv_mse_ridge(X, y, alphas, min_train=15):
+    """
+    Simple expanding-window time-series CV for Ridge.
+    Returns best_alpha, best_mse.
+    """
+    n = len(y)
+    if n <= min_train:
+        # Fallback: pick a mid alpha and compute in-sample loss
+        alpha_default = alphas[len(alphas) // 2]
+        scaler = StandardScaler()
+        Xs = scaler.fit_transform(X)
+        model = Ridge(alpha=alpha_default)
+        model.fit(Xs, y)
+        mse = float(np.mean((y - model.predict(Xs)) ** 2))
+        return alpha_default, mse
+
+    best_alpha, best_mse = None, np.inf
+    for a in alphas:
+        errs = []
+        for t in range(min_train, n):
+            X_train, y_train = X[:t], y[:t]
+            X_val, y_val = X[t: t + 1], y[t: t + 1]
+
+            scaler = StandardScaler()
+            X_train_s = scaler.fit_transform(X_train)
+            X_val_s = scaler.transform(X_val)
+
+            model = Ridge(alpha=a)
+            model.fit(X_train_s, y_train)
+            pred = model.predict(X_val_s)[0]
+            errs.append((y_val[0] - pred) ** 2)
+
+        mse = float(np.mean(errs))
+        if mse < best_mse:
+            best_mse = mse
+            best_alpha = a
+
+    return best_alpha, best_mse
+
+
+def ts_cv_mse_kernel_ridge(X, y, alphas, gammas, min_train=15):
+    """
+    Simple expanding-window time-series CV for Kernel Ridge (RBF).
+    Returns best_alpha, best_gamma, best_mse.
+    """
+    n = len(y)
+    if n <= min_train:
+        alpha_default = alphas[len(alphas) // 2]
+        gamma_default = gammas[len(gammas) // 2]
+        scaler = StandardScaler()
+        Xs = scaler.fit_transform(X)
+        model = KernelRidge(alpha=alpha_default, kernel="rbf", gamma=gamma_default)
+        model.fit(Xs, y)
+        mse = float(np.mean((y - model.predict(Xs)) ** 2))
+        return alpha_default, gamma_default, mse
+
+    best_alpha, best_gamma, best_mse = None, None, np.inf
+    for a in alphas:
+        for g in gammas:
+            errs = []
+            for t in range(min_train, n):
+                X_train, y_train = X[:t], y[:t]
+                X_val, y_val = X[t: t + 1], y[t: t + 1]
+
+                scaler = StandardScaler()
+                X_train_s = scaler.fit_transform(X_train)
+                X_val_s = scaler.transform(X_val)
+
+                model = KernelRidge(alpha=a, kernel="rbf", gamma=g)
+                model.fit(X_train_s, y_train)
+                pred = model.predict(X_val_s)[0]
+                errs.append((y_val[0] - pred) ** 2)
+
+            mse = float(np.mean(errs))
+            if mse < best_mse:
+                best_mse = mse
+                best_alpha, best_gamma = a, g
+
+    return best_alpha, best_gamma, best_mse
+
+
+# ------------------ MAIN ------------------
+
+def main():
+    raw = load_excel()
+    daily = build_daily(raw)
+
+    print(f"Daily rows after merging & cleaning: {len(daily)}")
+    df_sup, feature_cols = build_supervised(daily)
+
+    if len(df_sup) < MIN_TRAIN_ROWS + 5:
+        raise ValueError(f"Not enough rows in supervised dataset (got {len(df_sup)})")
+
+    # Decide forecast date
+    if FORECAST_DATE is None or FORECAST_DATE not in set(df_sup["date"]):
+        forecast_date = df_sup["date"].iloc[-1]
+    else:
+        forecast_date = FORECAST_DATE
+
+    # Split into training vs prediction row
+    train = df_sup[df_sup["date"] < forecast_date].copy()
+    pred_row = df_sup[df_sup["date"] == forecast_date].copy()
+
+    if pred_row.empty:
+        raise ValueError(f"No row found for forecast_date={forecast_date} in data")
+
+    if len(train) < MIN_TRAIN_ROWS:
+        raise ValueError(
+            f"Too few training rows before forecast_date (got {len(train)})"
+        )
+
+    # Restrict to most recent window
+    if len(train) > MAX_ROLL_WINDOW:
+        train = train.iloc[-MAX_ROLL_WINDOW:].copy()
+
+    X_train = train[feature_cols].to_numpy(dtype=float)
+    y_train = train["delta_open_from_last"].to_numpy(dtype=float)
+    X_fore = pred_row[feature_cols].to_numpy(dtype=float)
+
+    # ------------------ LINEAR RIDGE ------------------
+    alpha_grid_lin = [1e-3, 1e-2, 0.1, 1.0, 10.0]
+    best_alpha_lin, mse_lin = ts_cv_mse_ridge(
+        X_train, y_train, alpha_grid_lin, min_train=15
+    )
+
+    scaler_lin = StandardScaler()
+    X_train_lin = scaler_lin.fit_transform(X_train)
+    X_fore_lin = scaler_lin.transform(X_fore)
+
+    model_lin = Ridge(alpha=best_alpha_lin)
+    model_lin.fit(X_train_lin, y_train)
+    delta_lin = float(model_lin.predict(X_fore_lin)[0])
+
+    # ------------------ KERNEL RIDGE ------------------
+    alpha_grid_nl = [1e-3, 1e-2, 0.1, 1.0]
+    gamma_grid_nl = [0.01, 0.1, 1.0]
+
+    best_alpha_nl, best_gamma_nl, mse_nl = ts_cv_mse_kernel_ridge(
+        X_train, y_train, alpha_grid_nl, gamma_grid_nl, min_train=15
+    )
+
+    scaler_nl = StandardScaler()
+    X_train_nl = scaler_nl.fit_transform(X_train)
+    X_fore_nl = scaler_nl.transform(X_fore)
+
+    model_nl = KernelRidge(alpha=best_alpha_nl, kernel="rbf", gamma=best_gamma_nl)
+    model_nl.fit(X_train_nl, y_train)
+    delta_nl = float(model_nl.predict(X_fore_nl)[0])
+
+    # ------------------ COMBINE & ANCHOR ------------------
+    delta_avg = 0.5 * (delta_lin + delta_nl)
+
+    prev_last = float(pred_row["prev_gilt_last"].iloc[0])
+    pred_open_lin = prev_last + delta_lin
+    pred_open_nl = prev_last + delta_nl
+    pred_open_avg = prev_last + delta_avg
+
+    actual_open = float(pred_row["gilt_open"].iloc[0])
+
+    print("\n===== 10YR GILT OPEN FORECAST (7–8am intraday-aware model) =====")
+    print(f"Forecast date:                     {forecast_date}")
+    print(f"Training rows used:                {len(train)}")
+    print(f"Linear Ridge alpha*:               {best_alpha_lin:.4g}, CV MSE ~ {mse_lin:.6f}")
+    print(
+        f"Kernel Ridge alpha*, gamma*:       {best_alpha_nl:.4g}, {best_gamma_nl:.4g}, CV MSE ~ {mse_nl:.6f}"
+    )
+    print(f"Previous day's gilt last:          {prev_last:.4f}")
+    print(f"Predicted Δopen_from_last (lin):   {delta_lin:.4f}")
+    print(f"Predicted Δopen_from_last (nl):    {delta_nl:.4f}")
+    print(f"Predicted Δopen_from_last (avg):   {delta_avg:.4f}")
+    print(f"Linear forecast gilt open:         {pred_open_lin:.4f}")
+    print(f"Nonlinear forecast gilt open:      {pred_open_nl:.4f}")
+    print(f"Final averaged forecast gilt open: {pred_open_avg:.4f}")
+    print(f"Actual gilt open (if known):       {actual_open:.4f}")
+
+    # ------------------ PLOT LAST 3 + FORECAST ------------------
+    last_3 = df_sup[df_sup["date"] < forecast_date].tail(3).copy()
+    dates_plot = last_3["date"].tolist() + [forecast_date]
+    opens_plot = last_3["gilt_open"].tolist() + [pred_open_avg]
+
+    plt.figure(figsize=(7, 4))
+    plt.plot(
+        dates_plot[:-1],
+        opens_plot[:-1],
+        marker="o",
+        label="Actual gilt open (last 3 days)",
+    )
+    plt.plot(
+        dates_plot[-1],
+        opens_plot[-1],
+        marker="x",
+        markersize=10,
+        label=f"Forecast open {forecast_date}",
+    )
+    plt.title("10y Gilt Open: Last 3 Days + Forecast (7–8am intraday-aware)")
+    plt.xlabel("Date")
+    plt.ylabel("Gilt Open Price")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
