@@ -1,0 +1,43 @@
+import os
+import pandas as pd
+
+def load_external_daily(sheet: str = "Sheet1") -> pd.DataFrame:
+    """
+    Tries to load DATA_2.xlsx from:
+      1) Your Desktop:  ~/Desktop/DATA_2.xlsx
+      2) Current folder: ./DATA_2.xlsx
+    Raises a clear error if not found.
+    """
+    desktop = os.path.join(os.path.expanduser("~"), "Desktop", "DATA_2.xlsx")
+    local   = "DATA_2.xlsx"
+
+    path = None
+
+    if os.path.exists(desktop):
+        path = desktop
+    elif os.path.exists(local):
+        path = local
+    else:
+        raise FileNotFoundError(
+            f"DATA_2.xlsx not found.\n"
+            f"Tried:\n  {desktop}\n  {os.path.abspath(local)}"
+        )
+
+    print(f"Loading Excel from: {path}")
+    raw = pd.read_excel(path, sheet_name=sheet)
+
+    # rename columns to standard names
+    cols_map = {
+        "Unnamed: 0":      "date",
+        "10yr Gilt Last":  "gilt_close",
+        "10yr Gilt Open":  "gilt_open",
+        "VIX":             "VIX",
+        "10yr UST":        "ust_yield",
+    }
+    missing = [c for c in cols_map.keys() if c not in raw.columns]
+    if missing:
+        raise ValueError(f"Missing expected columns in DATA_2.xlsx: {missing}")
+
+    df = raw[list(cols_map.keys())].rename(columns=cols_map)
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    return df
