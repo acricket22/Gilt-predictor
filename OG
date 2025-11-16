@@ -1,0 +1,174 @@
+#%%
+"""
+Next-day 10yr Gilt Open Predictor (robust to small datasets)
+
+- learns: gilt_open_t = f(all_features_{t-1})
+- so it can forecast a future day (e.g. 2025-11-10) using only info from the last day in the file
+- automatically shrinks the training window if you don't have many rows
+"""
+
+import os
+import numpy as np
+import pandas as pd
+
+# target forecast date (just for printing)
+FORECAST_DATE = pd.to_datetime("2025-11-10").date()
+# max window we'll try to use
+MAX_ROLL_WINDOW = 60
+
+
+def load_excel(path="data.xlsx"):
+    """
+    Load data.xlsx from the current working directory (where the notebook is).
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"{path} not found in the current directory.\n"
+            f"Current working directory is: {os.getcwd()}"
+        )
+    print(f"Loading: {path}")
+    return pd.read_excel(path)
+
+
+def intraday_to_daily(df, time_col, val_col, prefix):
+    tmp = df[[time_col, val_col]].dropna().copy()
+    tmp["dt"] = pd.to_datetime(tmp[time_col])
+    tmp["date"] = tmp["dt"].dt.date
+    tmp = tmp.sort_values("dt")
+
+    firsts = tmp.groupby("date").head(1)[["date", val_col]].rename(columns={val_col: f"{prefix}_first"})
+    lasts = tmp.groupby("date").tail(1)[["date", val_col]].rename(columns={val_col: f"{prefix}_last"})
+
+    out = firsts.merge(lasts, on="date", how="inner")
+    out[f"{prefix}_delta"] = out[f"{prefix}_last"] - out[f"{prefix}_first"]
+    return out
+
+
+def build_daily(raw: pd.DataFrame) -> pd.DataFrame:
+    # target: gilt open
+    gilt = raw[["Unnamed: 3", "10yr Gilt Open"]].dropna().copy()
+    gilt["date"] = pd.to_datetime(gilt["Unnamed: 3"]).dt.date
+    gilt = gilt[["date", "10yr Gilt Open"]].rename(columns={"10yr Gilt Open": "gilt_open"})
+
+    # vix
+    vix = raw[["Unnamed: 6", "VIX"]].dropna().copy()
+    vix["date"] = pd.to_datetime(vix["Unnamed: 6"]).dt.date
+    vix = vix[["date", "VIX"]]
+
+    # intraday → daily
+    bund = intraday_to_daily(raw, "Unnamed: 9", "Bund 10yr", "bund")
+    ust = intraday_to_daily(raw, "Unnamed: 12", "10yr UST", "ust")
+    gbp = intraday_to_daily(raw, "Unnamed: 15", "GBPUSD Curncy", "gbp")
+
+    daily = (
+        gilt.merge(bund, on="date", how="left")
+        .merge(ust, on="date", how="left")
+        .merge(gbp, on="date", how="left")
+        .merge(vix, on="date", how="left")
+        .dropna()
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+    return daily
+
+
+def make_lagged(daily: pd.DataFrame) -> pd.DataFrame:
+    feat_cols = [
+        "bund_last", "bund_delta",
+        "ust_last", "ust_delta",
+        "gbp_last", "gbp_delta",
+        "VIX",
+        "gilt_open",
+    ]
+    for c in feat_cols:
+        daily[c + "_lag1"] = daily[c].shift(1)
+    daily = daily.dropna().reset_index(drop=True)
+    return daily
+
+
+def ridge_fit(X: np.ndarray, y: np.ndarray, alpha: float = 0.1) -> np.ndarray:
+    n = X.shape[1]
+    I = np.eye(n)
+    I[0, 0] = 0  # don't penalize intercept
+    return np.linalg.solve(X.T @ X + alpha * I, X.T @ y)
+
+
+def ridge_cv(X: np.ndarray, y: np.ndarray, alphas=(0.001, 0.01, 0.1, 1, 10)):
+    best_beta, best_alpha, best_loss = None, None, np.inf
+    for a in alphas:
+        beta = ridge_fit(X, y, a)
+        loss = np.mean((y - X @ beta) ** 2)
+        if loss < best_loss:
+            best_beta, best_alpha, best_loss = beta, a, loss
+    return best_beta, best_alpha
+
+
+def expand_nonlinear(df_feats: pd.DataFrame) -> pd.DataFrame:
+    X = df_feats.copy()
+    for c in df_feats.columns:
+        X[c + "_sq"] = df_feats[c] ** 2
+    if {"bund_delta_lag1", "ust_delta_lag1"}.issubset(df_feats.columns):
+        X["bund_ust_x_lag1"] = df_feats["bund_delta_lag1"] * df_feats["ust_delta_lag1"]
+    if {"gbp_delta_lag1", "VIX_lag1"}.issubset(df_feats.columns):
+        X["gbp_vix_x_lag1"] = df_feats["gbp_delta_lag1"] * df_feats["VIX_lag1"]
+    return X
+
+
+def main():
+    raw = load_excel()  # now loads ./data.xlsx in the notebook directory
+    daily = build_daily(raw)
+    daily = make_lagged(daily)
+
+    n = len(daily)
+    if n < 5:
+        raise ValueError(f"Still too few rows to train after lagging (got {n})")
+
+    # pick a window that fits your data
+    roll_window = min(MAX_ROLL_WINDOW, n - 1)
+
+    # train on the most recent window
+    recent = daily.iloc[-roll_window:].copy()
+
+    # target
+    y_train = recent["gilt_open"].to_numpy()
+
+    # lag feature columns
+    lag_cols = [c for c in recent.columns if c.endswith("_lag1")]
+
+    # base features
+    X_train_base = recent[lag_cols].to_numpy()
+    X_train_base_const = np.c_[np.ones(len(X_train_base)), X_train_base]
+
+    # model 1: linear ridge
+    beta_lin, _ = ridge_cv(X_train_base_const, y_train)
+
+    # model 2: nonlinear ridge
+    X_train_nl_df = expand_nonlinear(recent[lag_cols])
+    X_train_nl = X_train_nl_df.to_numpy()
+    X_train_nl_const = np.c_[np.ones(len(X_train_nl)), X_train_nl]
+    beta_nl, _ = ridge_cv(X_train_nl_const, y_train)
+
+    # forecast: use the last row (t-1) to predict t
+    last_row = daily.iloc[[-1]]
+
+    X_fore_base = last_row[lag_cols].to_numpy()
+    X_fore_base_const = np.c_[np.ones(1), X_fore_base]
+    pred_lin = float(X_fore_base_const @ beta_lin)
+
+    X_fore_nl_df = expand_nonlinear(last_row[lag_cols])
+    X_fore_nl = X_fore_nl_df.to_numpy()
+    X_fore_nl_const = np.c_[np.ones(1), X_fore_nl]
+    pred_nl = float(X_fore_nl_const @ beta_nl)
+
+    final_pred = 0.5 * (pred_lin + pred_nl)
+
+    print("\n===== 10YR GILT OPEN FORECAST =====")
+    print(f"Forecast date:            {FORECAST_DATE}")
+    print(f"Linear (lagged) forecast: {pred_lin:.4f}")
+    print(f"Nonlinear (lagged) fcst:  {pred_nl:.4f}")
+    print(f"Final averaged forecast:  {final_pred:.4f}")
+    print(f"(trained on last {roll_window} rows of your data)")
+
+
+# In a notebook you can just call:
+main()
