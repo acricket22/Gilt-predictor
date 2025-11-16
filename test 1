@@ -1,0 +1,171 @@
+import os
+from datetime import datetime, timedelta, date
+
+import numpy as np
+import pandas as pd
+import pytz
+import pdblp
+
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import mean_squared_error
+import joblib
+
+# ====== YOUR EXCEL PATH (this works) ======
+EXTERNAL_DAILY_XLSX = r"\\GBMLVFILFS02N02.rbres01.net\home10$\vijabai\Profile\Desktop\DATA_2.xlsx"
+EXTERNAL_SHEET_NAME = "Sheet1"
+
+print("Checking Excel path:", EXTERNAL_DAILY_XLSX)
+print("Exists? ->", os.path.exists(EXTERNAL_DAILY_XLSX))
+
+# Bloomberg settings
+LONDON_TZ = pytz.timezone("Europe/London")
+TICKERS = {
+    "bund_future": "RX1 Comdty",
+    "gbpusd_spot": "GBPUSD Curncy",
+}
+
+PREOPEN_START = (7, 0)
+PREOPEN_END   = (8, 0)
+BAR_INTERVAL_MIN = 5
+
+INTRADAY_LOOKBACK_DAYS = 365
+MODEL_PATH = "gilt_open_predictor.pkl"
+PREDICT_DATE = date(2025, 11, 17)
+
+
+def normalize_bdib(bars: pd.DataFrame) -> pd.DataFrame:
+    if bars is None or bars.empty:
+        return pd.DataFrame()
+    if isinstance(bars.index, pd.DatetimeIndex) and "time" not in bars.columns:
+        bars = bars.reset_index()
+    bars.columns = [str(c).lower() for c in bars.columns]
+    if "time" not in bars.columns and "datetime" in bars.columns:
+        bars = bars.rename(columns={"datetime": "time"})
+    if "close" not in bars.columns and "price" in bars.columns:
+        bars = bars.rename(columns={"price": "close"})
+    return bars[["time", "close"]]
+
+
+def get_intraday_first_last(con, ticker, dates, start_hm, end_hm, interval):
+    rows = []
+    for d in dates:
+        d_loc = d.astimezone(LONDON_TZ)
+        start_dt = d_loc.replace(hour=start_hm[0], minute=start_hm[1])
+        end_dt   = d_loc.replace(hour=end_hm[0],   minute=end_hm[1])
+        start_naive = start_dt.replace(tzinfo=None)
+        end_naive   = end_dt.replace(tzinfo=None)
+
+        try:
+            try:
+                bars = con.bdib(ticker, start_naive, end_naive, eventType="TRADE", interval=interval)
+            except TypeError:
+                bars = con.bdib(ticker, start_naive, end_naive, "TRADE", interval)
+            bars = normalize_bdib(bars)
+        except Exception:
+            continue
+
+        if bars.empty:
+            continue
+
+        bars = bars.sort_values("time")
+        rows.append({
+            "date": d_loc.date(),
+            "first": float(bars["close"].iloc[0]),
+            "last":  float(bars["close"].iloc[-1]),
+            "delta": float(bars["close"].iloc[-1] - bars["close"].iloc[0])
+        })
+    return pd.DataFrame(rows)
+
+
+def load_external_daily(path, sheet):
+    print("Reading:", path)
+    df = pd.read_excel(path, sheet_name=sheet)
+
+    df = df.rename(columns={
+        "Unnamed: 0": "date",
+        "10yr Gilt Last": "gilt_close",
+        "10yr Gilt Open": "gilt_open",
+        "VIX": "VIX",
+        "10yr UST": "ust_yield"
+    })
+
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    return df
+
+
+def fetch_intraday(dates):
+    con = pdblp.BCon(port=8194, host="localhost", timeout=5000)
+    con.start()
+
+    today = datetime.now(tz=LONDON_TZ).date()
+    cutoff = today - timedelta(days=INTRADAY_LOOKBACK_DAYS)
+
+    dates = pd.to_datetime(dates).dt.tz_localize(LONDON_TZ)
+    dates = dates[dates.date >= cutoff]
+
+    bund = get_intraday_first_last(con, TICKERS["bund_future"], dates, PREOPEN_START, PREOPEN_END, BAR_INTERVAL_MIN)
+    gbp  = get_intraday_first_last(con, TICKERS["gbpusd_spot"], dates, PREOPEN_START, PREOPEN_END, BAR_INTERVAL_MIN)
+
+    con.stop()
+
+    bund = bund.rename(columns={"first":"bund_first","last":"bund_last","delta":"bund_delta"})
+    gbp  = gbp.rename(columns={"first":"gbp_first","last":"gbp_last","delta":"gbp_delta"})
+    return bund, gbp
+
+
+def build_model_dataset(df):
+    df = df.sort_values("date")
+    df["gilt_close_lag1"] = df["gilt_close"].shift(1)
+    df["VIX_lag1"] = df["VIX"].shift(1)
+    df["ust_yield_lag1"] = df["ust_yield"].shift(1)
+
+    features = [
+        "gilt_close_lag1", "VIX_lag1", "ust_yield_lag1",
+        "bund_first","bund_last","bund_delta",
+        "gbp_first","gbp_last","gbp_delta"
+    ]
+
+    model_df = df.dropna(subset=["gilt_open"] + features)
+    return model_df, features
+
+
+def train_model(df, features):
+    X = df[features]
+    y = df["gilt_open"]
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, shuffle=False, test_size=0.15)
+
+    model = Pipeline([
+        ("scaler", StandardScaler()),
+        ("ridge", Ridge(alpha=3.0))
+    ])
+
+    model.fit(X_train, y_train)
+    preds = model.predict(X_test)
+
+    print("RMSE:", np.sqrt(mean_squared_error(y_test, preds)))
+    return model
+
+
+def main():
+    daily = load_external_daily(EXTERNAL_DAILY_XLSX, EXTERNAL_SHEET_NAME)
+
+    bund, gbp = fetch_intraday(daily["date"])
+
+    df = daily.merge(bund, on="date", how="left").merge(gbp, on="date", how="left")
+
+    model_df, features = build_model_dataset(df)
+    model = train_model(model_df, features)
+
+    joblib.dump(model, MODEL_PATH)
+    print("Model saved.")
+
+    row = df[df["date"] == PREDICT_DATE]
+    print("Prediction row:", row)
+
+
+if __name__ == "__main__":
+    main()
