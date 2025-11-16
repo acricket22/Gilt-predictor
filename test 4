@@ -1,0 +1,19 @@
+from datetime import date
+import pdblp
+
+con = pdblp.BCon(host="localhost", port=8194, timeout=5000)
+con.start()
+
+start = date(2025, 11, 1)
+end   = date(2025, 11, 15)
+
+print("GT10 Govt:")
+print(con.bdh("GT10 Govt", "PX_LAST", start, end))
+
+print("VIX Index:")
+print(con.bdh("VIX Index", "PX_LAST", start, end))
+
+print("G 1 Comdty:")
+print(con.bdh("G 1 Comdty", "PX_OPEN", start, end))
+
+con.stop()
