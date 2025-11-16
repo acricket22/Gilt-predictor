@@ -1,0 +1,166 @@
+import os
+from datetime import datetime, timedelta
+
+import pandas as pd
+import numpy as np
+import pytz
+from dateutil.relativedelta import relativedelta
+import pdblp  # Bloomberg Desktop API wrapper
+
+# --------- CONFIG ---------
+LONDON_TZ = pytz.timezone("Europe/London")
+
+# Verify these tickers in your Bloomberg:
+TICKERS = {
+    "gilt_future": "G 1 Comdty",    # 10y Gilt future (continuous 1st) — confirm!
+    "bund_future": "RX1 Comdty",    # Euro-Bund future (continuous 1st)
+    "ust_future":  "TY1 Comdty",    # US 10y Treasury future (continuous 1st)
+    "gbpusd_spot": "GBPUSD Curncy", # GBPUSD spot
+    "vix_index":   "VIX Index",     # CBOE VIX
+}
+
+# 5-minute pre-open window (London time)
+PREOPEN_START = (7, 0)   # 07:00
+PREOPEN_END   = (8, 0)   # 08:00
+BAR_INTERVAL_MIN = 5
+
+# How much history to pull
+INTRADAY_LOOKBACK_DAYS = 90
+DAILY_LOOKBACK_MONTHS = 3
+
+# Output file
+OUT_XLSX = "bbg_gilt_inputs.xlsx"
+# --------------------------
+
+
+def bbg_connect():
+    """Start a Bloomberg Desktop API connection (Terminal must be running)."""
+    con = pdblp.BCon(host="localhost", port=8194, timeout=5000)
+    con.start()
+    return con
+
+
+def business_days_london(start_date, end_date):
+    """Weekdays only. (Add a holiday calendar if you need UK bank hols precisely.)"""
+    return pd.date_range(start=start_date, end=end_date, freq="B", tz=LONDON_TZ)
+
+
+def get_intraday_first_last(con, ticker, dates, start_hm, end_hm, interval):
+    """
+    For each date (tz-aware, London), pull intraday bars in [start_hm, end_hm)
+    and return first/last/ delta for that window.
+    """
+    rows = []
+    for d in dates:
+        d_loc = d.astimezone(LONDON_TZ)
+        start_dt = d_loc.replace(hour=start_hm[0], minute=start_hm[1], second=0, microsecond=0)
+        end_dt   = d_loc.replace(hour=end_hm[0],   minute=end_hm[1],   second=0, microsecond=0)
+
+        # pdblp expects naive local datetimes
+        start_naive = start_dt.replace(tzinfo=None)
+        end_naive   = end_dt.replace(tzinfo=None)
+
+        try:
+            bars = con.bdib(ticker, start_naive, end_naive, event="TRADE", interval=interval)
+        except Exception as e:
+            # No data or permission issues — skip that date
+            continue
+
+        if bars.empty:
+            continue
+
+        bars = bars.sort_values("time")
+        first_px = float(bars["close"].iloc[0])
+        last_px  = float(bars["close"].iloc[-1])
+
+        rows.append({
+            "date": d_loc.date(),
+            "first": first_px,
+            "last": last_px,
+            "delta": last_px - first_px
+        })
+
+    return pd.DataFrame(rows)
+
+
+def get_daily_bdh(con, tickers, fields, start_date, end_date):
+    """
+    Thin wrapper over bdh; returns tidy long-form with columns [date, ticker, field, value].
+    """
+    df = con.bdh(tickers, fields, start_date, end_date)
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["date", "ticker", "field", "value"])
+    df = df.stack(level=0).reset_index()
+    df.columns = ["date", "field", "ticker", "value"]
+    return df
+
+
+def fetch_all():
+    con = bbg_connect()
+
+    # Date ranges
+    today_loc = datetime.now(tz=LONDON_TZ).date()
+    intraday_start = today_loc - timedelta(days=INTRADAY_LOOKBACK_DAYS)
+    daily_start = (datetime.now(tz=LONDON_TZ) - relativedelta(months=DAILY_LOOKBACK_MONTHS)).date()
+
+    # London business days
+    days = business_days_london(intraday_start, today_loc)
+
+    # 1) Intraday 07:00-08:00 for Bund, UST, GBPUSD
+    bund = get_intraday_first_last(con, TICKERS["bund_future"], days, PREOPEN_START, PREOPEN_END, BAR_INTERVAL_MIN)
+    ust  = get_intraday_first_last(con, TICKERS["ust_future"],  days, PREOPEN_START, PREOPEN_END, BAR_INTERVAL_MIN)
+    gbp  = get_intraday_first_last(con, TICKERS["gbpusd_spot"], days, PREOPEN_START, PREOPEN_END, BAR_INTERVAL_MIN)
+
+    bund = bund.rename(columns={"first": "bund_first", "last": "bund_last", "delta": "bund_delta"})
+    ust  = ust.rename(columns={"first": "ust_first",  "last": "ust_last",  "delta": "ust_delta"})
+    gbp  = gbp.rename(columns={"first": "gbp_first",  "last": "gbp_last",  "delta": "gbp_delta"})
+
+    # 2) Daily VIX (PX_LAST) and Gilt future PX_OPEN
+    daily_vix  = get_daily_bdh(con, [TICKERS["vix_index"]],   ["PX_LAST"], daily_start, today_loc)
+    daily_gilt = get_daily_bdh(con, [TICKERS["gilt_future"]], ["PX_OPEN"], daily_start, today_loc)
+
+    vix = daily_vix.query("field == 'PX_LAST'")[["date", "value"]].rename(columns={"value": "VIX"})
+    gilt = daily_gilt.query("field == 'PX_OPEN'")[["date", "value"]].rename(columns={"value": "gilt_open"})
+
+    # Merge to one daily frame (only where all series present)
+    daily = (
+        gilt.merge(bund, on="date", how="left")
+            .merge(ust,  on="date", how="left")
+            .merge(gbp,  on="date", how="left")
+            .merge(vix,  on="date", how="left")
+            .dropna()
+            .sort_values("date")
+            .reset_index(drop=True)
+    )
+
+    con.stop()
+    return {"bund": bund, "ust": ust, "gbp": gbp, "vix": vix, "gilt": gilt, "daily": daily}
+
+
+def main():
+    data = fetch_all()
+
+    # Quick previews in console
+    print("\n=== Bund 07:00–08:00 (5m) ===")
+    print(data["bund"].tail(5))
+    print("\n=== UST 07:00–08:00 (5m) ===")
+    print(data["ust"].tail(5))
+    print("\n=== GBPUSD 07:00–08:00 (5m) ===")
+    print(data["gbp"].tail(5))
+    print("\n=== VIX daily ===")
+    print(data["vix"].tail(5))
+    print("\n=== Gilt PX_OPEN daily ===")
+    print(data["gilt"].tail(5))
+    print("\n=== MERGED DAILY (for modeling) ===")
+    print(data["daily"].tail(10))
+
+    # Save to one Excel with sheets
+    with pd.ExcelWriter(OUT_XLSX, engine="xlsxwriter") as xw:
+        for key, df in data.items():
+            df.to_excel(xw, sheet_name=key[:31], index=False)
+
+    print(f"\nSaved all datasets to: {OUT_XLSX}")
+
+
+if __name__ == "__main__":
+    main()
