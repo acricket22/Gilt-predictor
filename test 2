@@ -1,0 +1,13 @@
+import pdblp
+from datetime import date
+
+con = pdblp.BCon(host="localhost", port=8194, timeout=5000, debug=True)
+con.start()
+
+start = "20251101"
+end   = "20251115"
+
+df = con.bdh("SPX Index", "PX_LAST", start, end)
+print(df)
+
+con.stop()
