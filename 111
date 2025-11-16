@@ -1,0 +1,41 @@
+import os
+import pandas as pd
+
+def load_and_print_excel():
+    # Try Desktop first
+    desktop_path = os.path.join(os.path.expanduser("~"), "Desktop", "DATA_2.xlsx")
+    local_path   = "DATA_2.xlsx"
+
+    if os.path.exists(desktop_path):
+        path = desktop_path
+    elif os.path.exists(local_path):
+        path = local_path
+    else:
+        raise FileNotFoundError(
+            "Could not find DATA_2.xlsx\n"
+            f"Tried:\n  {desktop_path}\n  {os.path.abspath(local_path)}"
+        )
+
+    print(f"\n📄 Loading Excel file from:\n{path}")
+
+    # Automatically detect the first sheet
+    xls = pd.ExcelFile(path)
+    sheet = xls.sheet_names[0]
+    print(f"➡️ Using sheet: {sheet}")
+
+    df = pd.read_excel(path, sheet_name=sheet)
+
+    print("\n=== FULL DATAFRAME ===")
+    print(df)
+
+    print("\n=== DATAFRAME INFO ===")
+    print(df.info())
+
+    print("\n=== FIRST 10 ROWS ===")
+    print(df.head(10))
+
+    return df
+
+
+# Run it
+df = load_and_print_excel()
