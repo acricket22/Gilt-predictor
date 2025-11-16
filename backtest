@@ -1,0 +1,61 @@
+from datetime import date
+import pandas as pd
+
+# ---- Choose the date you want to backtest ----
+TEST_DATE = date(2025, 11, 11)
+
+# ----------------------------------------------
+# 1) Get previous day (lag) row from your Excel data
+# ----------------------------------------------
+daily_sorted = daily.sort_values("date")
+prev = daily_sorted[daily_sorted["date"] < TEST_DATE].iloc[-1]
+
+print("Previous-day data used (10-Nov-2025):")
+print(prev[["date","gilt_close","VIX","ust_yield"]])
+print()
+
+# ----------------------------------------------
+# 2) Get intraday Bund & GBP for the TEST_DATE
+# ----------------------------------------------
+bund_test, gbp_test = fetch_intraday_bund_gbp(pd.Series([TEST_DATE]))
+intraday_test = bund_test.merge(gbp_test, on="date", how="inner")
+
+if intraday_test.empty:
+    raise ValueError(f"No intraday data available for {TEST_DATE}")
+
+intraday_test = intraday_test.set_index("date").loc[TEST_DATE]
+
+print("Intraday data used (Bund + GBP, 07:00–08:00):")
+print(intraday_test)
+print()
+
+# ----------------------------------------------
+# 3) Build feature row
+# ----------------------------------------------
+feat = {
+    "gilt_close_lag1": prev["gilt_close"],
+    "VIX_lag1": prev["VIX"],
+    "ust_yield_lag1": prev["ust_yield"],
+    "bund_first": intraday_test["bund_first"],
+    "bund_last": intraday_test["bund_last"],
+    "bund_delta": intraday_test["bund_delta"],
+    "gbp_first": intraday_test["gbp_first"],
+    "gbp_last": intraday_test["gbp_last"],
+    "gbp_delta": intraday_test["gbp_delta"],
+}
+
+X_test = pd.DataFrame([feat])
+
+# ----------------------------------------------
+# 4) Predict 
+# ----------------------------------------------
+predicted_open = float(model.predict(X_test)[0])
+
+# ----------------------------------------------
+# 5) Get actual
+# ----------------------------------------------
+actual_open = float(daily_sorted[daily_sorted["date"] == TEST_DATE]["gilt_open"].iloc[0])
+
+print(f"MODEL PREDICTION for {TEST_DATE}:  {predicted_open:.3f}")
+print(f"ACTUAL GILT OPEN on {TEST_DATE}:    {actual_open:.3f}")
+print(f"ERROR: {predicted_open - actual_open:+.3f}")
