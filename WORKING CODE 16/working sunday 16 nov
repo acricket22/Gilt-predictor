@@ -51,21 +51,10 @@ MIN_TRAIN_ROWS = 20  # minimum rows required before forecast date
 
 # ------------------ DATA LOADING ------------------
 
-def load_excel():
-    """
-    Looks for data.xlsx on Desktop or in current folder.
-    """
-    desktop = os.path.expanduser("~/Desktop/data.xlsx")
-    local = "data.xlsx"
-    if os.path.exists(desktop):
-        path = desktop
-    elif os.path.exists(local):
-        path = local
-    else:
-        raise FileNotFoundError("data.xlsx not found on Desktop or in current folder")
-    print(f"Loading Excel: {path}")
-    return pd.read_excel(path)
 
+def load_excel():
+    """Load data.xlsx from the current Jupyter working directory."""
+    return pd.read_excel("data.xlsx")
 
 # ------------------ INTRADAY 7–8am FEATURES ------------------
 
