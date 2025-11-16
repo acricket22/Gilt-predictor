@@ -1,0 +1,399 @@
+import os
+from datetime import datetime, timedelta, date
+
+import numpy as np
+import pandas as pd
+import pytz
+import pdblp
+
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import RidgeCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import mean_squared_error
+
+# ========= CONFIG =========
+
+LONDON_TZ = pytz.timezone("Europe/London")
+
+TICKERS = {
+    "bund_future": "RX1 Comdty",
+    "gbpusd_spot": "GBPUSD Curncy",
+}
+
+PREOPEN_START = (7, 0)   # 07:00 London
+PREOPEN_END   = (8, 0)   # 08:00 London
+BAR_INTERVAL_MIN = 5
+INTRADAY_LOOKBACK_DAYS = 365
+
+LOCAL_XLSX = "DATA_2.xlsx"
+
+# Date you want a prediction for
+PREDICT_DATE = date(2025, 11, 13)
+
+# ==========================
+
+
+# ---- 1. Load daily data from local Excel ----
+
+def load_daily_from_local(path=LOCAL_XLSX, sheet=None) -> pd.DataFrame:
+    """
+    Load daily Gilt, VIX, and UST from DATA_2.xlsx in the current directory.
+    Uses first sheet by default, and normalises column names.
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"{path} not found in cwd={os.getcwd()}\nFiles: {os.listdir()}"
+        )
+
+    # Detect sheet
+    if sheet is None:
+        xls = pd.ExcelFile(path)
+        sheet = xls.sheet_names[0]
+        print(f"Using sheet: {sheet}")
+
+    raw = pd.read_excel(path, sheet_name=sheet)
+
+    # Strip whitespace from column names so '10yr UST ' becomes '10yr UST'
+    raw.rename(columns=lambda c: str(c).strip(), inplace=True)
+
+    # First column (A) is the main date
+    date_col_name = raw.columns[0]
+
+    cols_map = {
+        date_col_name:    "date",        # Column A
+        "10yr Gilt Last": "gilt_close",  # Column B
+        "10yr Gilt Open": "gilt_open",   # Column D
+        "VIX":            "VIX",         # Column F
+        "10yr UST":       "ust_yield",   # Column K
+    }
+
+    missing = [c for c in cols_map if c not in raw.columns]
+    if missing:
+        raise ValueError(
+            f"Missing expected columns in Excel file: {missing}\n"
+            f"Got columns: {list(raw.columns)}"
+        )
+
+    df = raw[list(cols_map.keys())].rename(columns=cols_map)
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    df = df.dropna(subset=["date"]).reset_index(drop=True)
+
+    print(f"Loaded daily rows: {len(df)}")
+    return df
+
+
+# ---- 2. Bloomberg intraday helpers (Bund & Cable) ----
+
+def normalize_bdib(bars: pd.DataFrame) -> pd.DataFrame:
+    if bars is None or bars.empty:
+        return pd.DataFrame()
+
+    if isinstance(bars.index, pd.DatetimeIndex) and "time" not in bars.columns:
+        bars = bars.reset_index()
+
+    bars.columns = [str(c).lower() for c in bars.columns]
+
+    if "time" not in bars.columns and "datetime" in bars.columns:
+        bars = bars.rename(columns={"datetime": "time"})
+    if "close" not in bars.columns and "price" in bars.columns:
+        bars = bars.rename(columns={"price": "close"})
+
+    if "time" not in bars.columns or "close" not in bars.columns:
+        raise ValueError("bdib output missing time/close columns")
+
+    return bars[["time", "close"]]
+
+
+def get_intraday_first_last(
+    con: pdblp.BCon,
+    ticker: str,
+    dates: pd.DatetimeIndex,
+    start_hm,
+    end_hm,
+    interval: int,
+) -> pd.DataFrame:
+    rows = []
+
+    for d in dates:
+        d_loc = d.astimezone(LONDON_TZ)
+
+        start_dt = d_loc.replace(hour=start_hm[0], minute=start_hm[1])
+        end_dt   = d_loc.replace(hour=end_hm[0],   minute=end_hm[1])
+
+        start_naive = start_dt.replace(tzinfo=None)
+        end_naive   = end_dt.replace(tzinfo=None)
+
+        try:
+            try:
+                bars = con.bdib(
+                    ticker,
+                    start_naive,
+                    end_naive,
+                    eventType="TRADE",
+                    interval=interval,
+                )
+            except TypeError:
+                bars = con.bdib(
+                    ticker,
+                    start_naive,
+                    end_naive,
+                    "TRADE",
+                    interval,
+                )
+            bars = normalize_bdib(bars)
+        except Exception as e:
+            print(f"bdib error for {ticker} on {d_loc.date()}: {e}")
+            continue
+
+        if bars.empty:
+            continue
+
+        bars = bars.sort_values("time")
+        first_px = float(bars["close"].iloc[0])
+        last_px  = float(bars["close"].iloc[-1])
+
+        rows.append(
+            {
+                "date": d_loc.date(),
+                "first": first_px,
+                "last":  last_px,
+                "delta": last_px - first_px,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def fetch_intraday_bund_gbp(dates: pd.Series):
+    """
+    Fetch Bund & GBPUSD pre-open features (07:00–08:00 London) for the given dates.
+    """
+    con = pdblp.BCon(host="localhost", port=8194, timeout=5000)
+    con.start()
+
+    today_loc = datetime.now(tz=LONDON_TZ).date()
+    cutoff = today_loc - timedelta(days=INTRADAY_LOOKBACK_DAYS)
+
+    dates_tz = pd.to_datetime(dates).dt.tz_localize(LONDON_TZ)
+    dates_tz = dates_tz[dates_tz.dt.date >= cutoff].drop_duplicates()
+
+    if dates_tz.empty:
+        print("No dates within lookback window for intraday fetch.")
+        con.stop()
+        return pd.DataFrame(), pd.DataFrame()
+
+    print("Pulling intraday Bund & GBPUSD (07:00–08:00 London)...")
+    bund = get_intraday_first_last(
+        con,
+        TICKERS["bund_future"],
+        dates_tz,
+        PREOPEN_START,
+        PREOPEN_END,
+        BAR_INTERVAL_MIN,
+    )
+    gbp = get_intraday_first_last(
+        con,
+        TICKERS["gbpusd_spot"],
+        dates_tz,
+        PREOPEN_START,
+        PREOPEN_END,
+        BAR_INTERVAL_MIN,
+    )
+
+    con.stop()
+
+    bund = bund.rename(columns={
+        "first": "bund_first",
+        "last":  "bund_last",
+        "delta": "bund_delta",
+    })
+    gbp  = gbp.rename(columns={
+        "first": "gbp_first",
+        "last":  "gbp_last",
+        "delta": "gbp_delta",
+    })
+
+    return bund, gbp
+
+
+# ---- 3. Feature engineering: “improved” dataset ----
+
+def build_improved_dataset(daily_merged: pd.DataFrame):
+    """
+    Target: gap = Gilt_open(T) - Gilt_close(T-1)
+    Features:
+      - prev_gap (gap lag 1)
+      - ΔUST, ΔVIX (changes vs T-1)
+      - prev_close (Gilt_close T-1)
+      - Bund & GBP pre-open returns (first→last, in bps)
+      - Bund & GBP pre-open level (last)
+    """
+    df = daily_merged.copy().sort_values("date").reset_index(drop=True)
+
+    # lagged close
+    df["gilt_close_lag1"] = df["gilt_close"].shift(1)
+
+    # target: gap vs previous close
+    df["gap"] = df["gilt_open"] - df["gilt_close_lag1"]
+    df["gap_lag1"] = df["gap"].shift(1)
+
+    # changes in UST & VIX
+    df["ust_yield_lag1"] = df["ust_yield"].shift(1)
+    df["VIX_lag1"]       = df["VIX"].shift(1)
+    df["ust_change"]     = df["ust_yield"] - df["ust_yield_lag1"]
+    df["VIX_change"]     = df["VIX"] - df["VIX_lag1"]
+
+    # Bund & GBP pre-open returns (simple return and level)
+    for prefix in ["bund", "gbp"]:
+        df[f"{prefix}_ret"] = (df[f"{prefix}_last"] - df[f"{prefix}_first"]) / df[f"{prefix}_first"]
+        df[f"{prefix}_ret_bps"] = 10000 * df[f"{prefix}_ret"]  # basis points
+
+    feature_cols = [
+        "gap_lag1",
+        "gilt_close_lag1",
+        "ust_change",
+        "VIX_change",
+        "bund_ret_bps",
+        "gbp_ret_bps",
+        "bund_last",
+        "gbp_last",
+    ]
+
+    df_model = df.dropna(subset=["gap"] + feature_cols).copy()
+    return df_model, feature_cols
+
+
+# ---- 4. Train improved model ----
+
+def train_improved_model(df_model: pd.DataFrame, feature_cols):
+    X = df_model[feature_cols]
+    y = df_model["gap"]  # predict the gap
+
+    # Use cross-validated Ridge to choose regularisation strength
+    alphas = np.logspace(-3, 3, 20)
+    model = Pipeline([
+        ("scaler", StandardScaler()),
+        ("reg", RidgeCV(alphas=alphas)),
+    ])
+    model.fit(X, y)
+
+    # Out-of-sample evaluation on the last 20% of data
+    split = int(len(df_model) * 0.8)
+    X_train, X_test = X.iloc[:split], X.iloc[split:]
+    y_train, y_test = y.iloc[:split], y.iloc[split:]
+
+    model.fit(X_train, y_train)
+    preds = model.predict(X_test)
+    rmse = np.sqrt(mean_squared_error(y_test, preds))
+    print(f"\nImproved model – test RMSE on gap: {rmse:.4f}")
+
+    reg = model.named_steps["reg"]
+    coefs = reg.coef_
+    feature_importance = pd.Series(coefs, index=feature_cols).sort_values(
+        key=np.abs, ascending=False
+    )
+
+    print("\nImproved model feature weights (Ridge betas, on scaled inputs):")
+    print(feature_importance)
+
+    return model
+
+
+# ---- 5. Predict for a specific date using improved features ----
+
+def predict_open_for_date(pred_date: date, model, daily_merged: pd.DataFrame, feature_cols):
+    dm = daily_merged.sort_values("date").reset_index(drop=True)
+
+    if pred_date not in dm["date"].values:
+        raise ValueError(f"{pred_date} not present in daily data (Excel).")
+
+    # Build the same engineered features as in build_improved_dataset, but
+    # directly on the merged dataframe
+    dm["gilt_close_lag1"] = dm["gilt_close"].shift(1)
+    dm["gap"]             = dm["gilt_open"] - dm["gilt_close_lag1"]
+    dm["gap_lag1"]        = dm["gap"].shift(1)
+    dm["ust_yield_lag1"]  = dm["ust_yield"].shift(1)
+    dm["VIX_lag1"]        = dm["VIX"].shift(1)
+    dm["ust_change"]      = dm["ust_yield"] - dm["ust_yield_lag1"]
+    dm["VIX_change"]      = dm["VIX"] - dm["VIX_lag1"]
+
+    for prefix in ["bund", "gbp"]:
+        dm[f"{prefix}_ret"] = (dm[f"{prefix}_last"] - dm[f"{prefix}_first"]) / dm[f"{prefix}_first"]
+        dm[f"{prefix}_ret_bps"] = 10000 * dm[f"{prefix}_ret"]
+
+    row = dm[dm["date"] == pred_date].copy()
+    if row.empty:
+        raise ValueError(f"No row for {pred_date} after feature engineering.")
+
+    # We need previous day for gap_lag1 etc., so ensure it exists
+    idx = row.index[0]
+    if idx == 0:
+        raise ValueError(f"{pred_date} is the first row – no lagged data available.")
+
+    # Check for missing inputs
+    if row[feature_cols].isnull().any(axis=None):
+        raise ValueError(
+            f"Missing inputs for {pred_date}; "
+            f"check Bund/GBP intraday or daily data."
+        )
+
+    X_pred = row[feature_cols]
+    predicted_gap = float(model.predict(X_pred)[0])
+
+    prev_close = float(row["gilt_close_lag1"])
+    predicted_open = prev_close + predicted_gap
+
+    # Actual open from Excel
+    actual_open = float(row["gilt_open"])
+
+    return {
+        "predicted_open": predicted_open,
+        "predicted_gap": predicted_gap,
+        "prev_close": prev_close,
+        "actual_open": actual_open,
+        "error": predicted_open - actual_open,
+    }
+
+
+# ---- 6. Main ----
+
+def main():
+    # 1) Daily from Excel
+    daily = load_daily_from_local()
+
+    # 2) Intraday Bund & Cable from Bloomberg
+    bund, gbp = fetch_intraday_bund_gbp(daily["date"])
+
+    # 3) Merge daily + intraday
+    daily_merged = (
+        daily.merge(bund, on="date", how="left")
+             .merge(gbp,  on="date", how="left")
+    )
+
+    # 4) Build improved dataset and train model
+    df_model, feature_cols = build_improved_dataset(daily_merged)
+    print(f"\nSamples for training (improved set): {len(df_model)}")
+
+    if len(df_model) < 40:
+        print("⚠ Very small sample size; expect noisy coefficients.")
+
+    model = train_improved_model(df_model, feature_cols)
+
+    # 5) Predict for 13-Nov-2025 and compare to actual
+    try:
+        res = predict_open_for_date(PREDICT_DATE, model, daily_merged, feature_cols)
+
+        print(f"\n=== Prediction for {PREDICT_DATE} (improved model) ===")
+        print(f"Prev close:              {res['prev_close']:.3f}")
+        print(f"Predicted gap (open-close_prev): {res['predicted_gap']:+.3f}")
+        print(f"Predicted Gilt open:     {res['predicted_open']:.3f}")
+        print(f"Actual    Gilt open:     {res['actual_open']:.3f}")
+        print(f"Error (pred - actual):   {res['error']:+.3f}")
+
+    except Exception as e:
+        print(f"\nCould not compute prediction for {PREDICT_DATE}: {e}")
+
+
+if __name__ == "__main__":
+    main()
