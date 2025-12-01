@@ -1,0 +1,254 @@
+# ============================================================
+#  JPY & AUD CCS basis – intraday session analysis (BQuant)
+#  Sessions: 00:00–07:00, 07:00–10:00, 10:00–16:00 (London)
+#  Tenors: 1m, 3m, 2y, 5y
+#  Lookbacks: 3m (~90 days), 1y (~365 days)
+# ============================================================
+
+import bql
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+
+# ------------------------------------------------------------
+# 0. BQL service
+# ------------------------------------------------------------
+bq = bql.Service()
+
+# ------------------------------------------------------------
+# 1. DEFINE YOUR CCS BASIS TICKERS HERE
+#    Replace placeholder strings with real Bloomberg tickers.
+#    Example style (yours may differ):
+#    "JPY": {"1m": "USDKRW1M CMPN Curncy", ...}
+# ------------------------------------------------------------
+TICKERS = {
+    "JPY": {
+        "1m": "<JPY_1M_CCS_TICKER>",
+        "3m": "<JPY_3M_CCS_TICKER>",
+        "2y": "<JPY_2Y_CCS_TICKER>",
+        "5y": "<JPY_5Y_CCS_TICKER>",
+    },
+    "AUD": {
+        "1m": "<AUD_1M_CCS_TICKER>",
+        "3m": "<AUD_3M_CCS_TICKER>",
+        "2y": "<AUD_2Y_CCS_TICKER>",
+        "5y": "<AUD_5Y_CCS_TICKER>",
+    },
+}
+
+# Intraday snapshot times in *London* time
+SESSION_TIMES = ["00:00", "07:00", "10:00", "16:00"]
+
+# Lookback windows in calendar days (approx)
+LOOKBACK_WINDOWS = {
+    "3m": 90,
+    "1y": 365,
+}
+
+# ------------------------------------------------------------
+# 2. Fetch 60-minute intraday PX_LAST via BQL
+#
+# IMPORTANT:
+#   - If this fails, open BQLX <GO>, build an intraday-bar query
+#     for one CCS ticker, and copy the generated Python expression
+#     to replace the bq.data.intraday_bar(...) below.
+# ------------------------------------------------------------
+def fetch_intraday_hourly_px_last(
+    ticker: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    tz: str = "Europe/London",
+) -> pd.DataFrame:
+    """
+    Fetch 1-hour intraday PX_LAST bars between start_dt and end_dt (inclusive)
+    in the given timezone.
+
+    Returns DataFrame with columns: ['time', 'px_last'].
+    """
+
+    # ---- Adjust this to match your environment if needed ----
+    intraday_expr = bq.data.intraday_bar(
+        "PX_LAST",
+        interval=60,               # 60-min bars
+        startDateTime=start_dt,
+        endDateTime=end_dt,
+        timeZone=tz,
+    )
+
+    req = bql.Request(ticker, intraday_expr)
+    res = bq.execute(req)
+    df = bql.combined_df(res).reset_index()
+
+    # Depending on BQL version, the time/value column names can differ:
+    #  - time: often 'TIMESTAMP' or in the index
+    #  - value: often 'PX_LAST' or 'value'
+    # The logic below tries to be robust; tweak if necessary.
+
+    # identify time column
+    if "TIMESTAMP" in df.columns:
+        time_col = "TIMESTAMP"
+    elif "time" in df.columns:
+        time_col = "time"
+    else:
+        time_col = df.columns[0]  # fallback: first column
+
+    # identify value column
+    possible_val_cols = [c for c in df.columns if c.upper() in ["VALUE", "PX_LAST"]]
+    if possible_val_cols:
+        val_col = possible_val_cols[0]
+    else:
+        val_col = df.columns[-1]  # fallback: last column
+
+    df = df.rename(columns={time_col: "time", val_col: "px_last"})
+    df["time"] = pd.to_datetime(df["time"])
+    df = df[["time", "px_last"]].dropna()
+
+    return df
+
+
+# ------------------------------------------------------------
+# 3. Build daily snapshots + Δ1/Δ2/Δ3 from intraday data
+# ------------------------------------------------------------
+def build_daily_moves(df_intraday: pd.DataFrame) -> pd.DataFrame:
+    """
+    From intraday hourly data (time, px_last), extract snapshots at
+    00:00, 07:00, 10:00, 16:00 London and compute:
+
+        Δ1 = 07:00 - 00:00
+        Δ2 = 10:00 - 07:00
+        Δ3 = 16:00 - 10:00
+
+    Returns DataFrame indexed by date with columns:
+        px_0000, px_0700, px_1000, px_1600,
+        d1_0000_0700, d2_0700_1000, d3_1000_1600
+    """
+
+    df = df_intraday.copy()
+    df["time"] = pd.to_datetime(df["time"])
+    df = df.sort_values("time")
+
+    df["date"] = df["time"].dt.date
+    df["hhmm"] = df["time"].dt.strftime("%H:%M")
+
+    # Keep only the four snapshot times
+    snap = df[df["hhmm"].isin(SESSION_TIMES)].copy()
+
+    # Pivot to 1 row per date
+    pivot = snap.pivot_table(
+        index="date",
+        columns="hhmm",
+        values="px_last",
+        aggfunc="last",  # if multiple bars at same hh:mm, take last
+    )
+
+    pivot = pivot.rename(
+        columns={
+            "00:00": "px_0000",
+            "07:00": "px_0700",
+            "10:00": "px_1000",
+            "16:00": "px_1600",
+        }
+    )
+
+    # Require all 4 points to exist for the day
+    pivot = pivot.dropna(subset=["px_0000", "px_0700", "px_1000", "px_1600"])
+
+    # Intraday moves
+    pivot["d1_0000_0700"] = pivot["px_0700"] - pivot["px_0000"]
+    pivot["d2_0700_1000"] = pivot["px_1000"] - pivot["px_0700"]
+    pivot["d3_1000_1600"] = pivot["px_1600"] - pivot["px_1000"]
+
+    return pivot
+
+
+# ------------------------------------------------------------
+# 4. Run analysis for one ticker & one lookback window
+# ------------------------------------------------------------
+def run_analysis_for_ticker(
+    ticker: str,
+    lookback_label: str,
+    lookback_days: int,
+):
+    """
+    Pull intraday data for ticker over lookback_days,
+    build Δ1/Δ2/Δ3, return daily series + summary stats + correlation.
+    """
+
+    end_dt = datetime.now()
+    start_dt = end_dt - timedelta(days=lookback_days)
+
+    intraday_df = fetch_intraday_hourly_px_last(ticker, start_dt, end_dt)
+    if intraday_df.empty:
+        print(f"No intraday data for {ticker} over last {lookback_days} days.")
+        return None
+
+    daily = build_daily_moves(intraday_df)
+
+    if daily.empty:
+        print(f"No valid 4-point days for {ticker} over last {lookback_days} days.")
+        return None
+
+    moves_cols = ["d1_0000_0700", "d2_0700_1000", "d3_1000_1600"]
+    stats = daily[moves_cols].describe().T
+    corr = daily[moves_cols].corr()
+
+    print(f"\n============================================================")
+    print(f"Ticker: {ticker} | Lookback: {lookback_label} ({lookback_days} days)")
+    print(f"Number of days: {len(daily)}")
+    print("============================================================\n")
+
+    print("Mean / Std / Min / Max of intraday moves:")
+    display(stats[["mean", "std", "min", "max"]])
+
+    print("\nCorrelation matrix between session moves (Δ1, Δ2, Δ3):")
+    display(corr)
+
+    return {
+        "daily": daily,
+        "stats": stats,
+        "corr": corr,
+    }
+
+
+# ------------------------------------------------------------
+# 5. (Optional) Simple regression: London move vs Asia move
+# ------------------------------------------------------------
+import statsmodels.api as sm
+
+def regress_london_on_asia(daily_df: pd.DataFrame):
+    """
+    OLS regression:
+        Δ3 (10:00–16:00) = a + b * Δ1 (00:00–07:00) + ε
+    """
+    y = daily_df["d3_1000_1600"]
+    X = sm.add_constant(daily_df["d1_0000_0700"])
+    model = sm.OLS(y, X).fit()
+    return model
+
+
+# ------------------------------------------------------------
+# 6. MAIN LOOP – run for all currencies / tenors / lookbacks
+# ------------------------------------------------------------
+results = {}  # (ccy, tenor, lookback_label) -> dict(daily, stats, corr, model)
+
+for ccy, tenor_map in TICKERS.items():
+    for tenor, ticker in tenor_map.items():
+        # skip placeholders that you haven't filled in
+        if not ticker or ticker.startswith("<"):
+            continue
+
+        for lbl, days in LOOKBACK_WINDOWS.items():
+            key = (ccy, tenor, lbl)
+            res = run_analysis_for_ticker(ticker, lbl, days)
+            if res is None:
+                continue
+
+            # OLS regression: Δ3 on Δ1 (optional but useful)
+            model = regress_london_on_asia(res["daily"])
+            print(f"\nOLS: Δ3 (10–16) on Δ1 (00–07) for {ticker} [{lbl}]")
+            print(model.summary())
+
+            res["model"] = model
+            results[key] = res
+
+print("\nDone. 'results' dict now holds daily series, stats, corr, and regression model per (ccy, tenor, lookback).")
